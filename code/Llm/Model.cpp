@@ -281,6 +281,7 @@ bool Model::bindTensors()
 
 		outValues.resize((size_t)tensor->getElementCount());
 		dequantize(tensor->type, tensor->data, outValues.ptr(), (uint32_t)tensor->getElementCount());
+		log::info << L"Bound vector \"" << name << L"\"; " << (int32_t)outValues.size() << L" element(s)." << Endl;
 	};
 
 	m_tokenEmbedding = bind(L"token_embd.weight", true);
@@ -309,25 +310,24 @@ bool Model::bindTensors()
 	m_layers.resize(m_parameters.layerCount);
 	for (int32_t i = 0; i < m_parameters.layerCount; ++i)
 	{
-		const std::wstring prefix = L"blk." + toString(i) + L".";
 		ModelLayer& layer = m_layers[i];
 
-		bindVector(prefix + L"attn_norm.weight", true, layer.attentionNorm);
-		bindVector(prefix + L"ffn_norm.weight", true, layer.feedForwardNorm);
+		bindVector(str(L"blk.%d.attn_norm.weight", i), true, layer.attentionNorm);
+		bindVector(str(L"blk.%d.ffn_norm.weight", i), true, layer.feedForwardNorm);
 
-		layer.attentionQ = bind(prefix + L"attn_q.weight", true);
-		layer.attentionK = bind(prefix + L"attn_k.weight", true);
-		layer.attentionV = bind(prefix + L"attn_v.weight", true);
-		layer.attentionOutput = bind(prefix + L"attn_output.weight", true);
+		layer.attentionQ = bind(str(L"blk.%d.attn_q.weight", i), true);
+		layer.attentionK = bind(str(L"blk.%d.attn_k.weight", i), true);
+		layer.attentionV = bind(str(L"blk.%d.attn_v.weight", i), true);
+		layer.attentionOutput = bind(str(L"blk.%d.attn_output.weight", i), true);
 
-		layer.feedForwardGate = bind(prefix + L"ffn_gate.weight", true);
-		layer.feedForwardUp = bind(prefix + L"ffn_up.weight", true);
-		layer.feedForwardDown = bind(prefix + L"ffn_down.weight", true);
+		layer.feedForwardGate = bind(str(L"blk.%d.ffn_gate.weight", i), true);
+		layer.feedForwardUp = bind(str(L"blk.%d.ffn_up.weight", i), true);
+		layer.feedForwardDown = bind(str(L"blk.%d.ffn_down.weight", i), true);
 
 		// Qwen carries a bias on the attention projections; Llama does not.
-		bindVector(prefix + L"attn_q.bias", false, layer.attentionQBias);
-		bindVector(prefix + L"attn_k.bias", false, layer.attentionKBias);
-		bindVector(prefix + L"attn_v.bias", false, layer.attentionVBias);
+		bindVector(str(L"blk.%d.attn_q.bias", i), false, layer.attentionQBias);
+		bindVector(str(L"blk.%d.attn_k.bias", i), false, layer.attentionKBias);
+		bindVector(str(L"blk.%d.attn_v.bias", i), false, layer.attentionVBias);
 	}
 
 	if (!valid)

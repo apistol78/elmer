@@ -9,10 +9,12 @@
 #include "Llm/Context.h"
 
 #include "Core/Log/Log.h"
+#include "Core/Timer/Timer.h"
 #include "Llm/GgufFile.h"
 #include "Llm/Model.h"
 #include "Llm/Ops.h"
 #include "Llm/Quant.h"
+#include "Llm/Trace.h"
 
 #include <cmath>
 
@@ -28,6 +30,38 @@ void addBias(float* x, const AlignedVector< float >& bias, int32_t n)
 	for (int32_t i = 0; i < n; ++i)
 		x[i] += bias[i];
 }
+
+/*! Euclidean length of \a x, accumulated in double. */
+float length(const float* x, int32_t n)
+{
+	double sum = 0.0;
+	for (int32_t i = 0; i < n; ++i)
+		sum += (double)x[i] * x[i];
+	return (float)std::sqrt(sum);
+}
+
+/*! Charges elapsed time to stages of a ForwardTrace; does nothing without one. */
+class StageClock
+{
+public:
+	explicit StageClock(ForwardTrace* trace)
+		: m_trace(trace)
+	{
+		if (m_trace)
+			m_timer.reset();
+	}
+
+	/*! Charge the time since the last mark to \a stage. */
+	void mark(ForwardTrace::Stage stage)
+	{
+		if (m_trace)
+			m_trace->stageSeconds[stage] += m_timer.getDeltaTime();
+	}
+
+private:
+	ForwardTrace* m_trace;
+	Timer m_timer;
+};
 
 }
 
@@ -113,7 +147,7 @@ void Context::rewind(int32_t position)
 	m_logitsValid = false;
 }
 
-bool Context::evaluate(int32_t token, bool computeLogits)
+bool Context::evaluate(int32_t token, bool computeLogits, ForwardTrace* outTrace)
 {
 	if (!m_model || m_position >= m_contextLength)
 		return false;
@@ -129,10 +163,26 @@ bool Context::evaluate(int32_t token, bool computeLogits)
 
 	m_logitsValid = false;
 
+	if (outTrace)
+	{
+		*outTrace = ForwardTrace();
+		outTrace->token = token;
+		outTrace->position = position;
+		outTrace->layerCount = parameters.layerCount;
+		outTrace->residualNorms.reserve(parameters.layerCount);
+	}
+
+	StageClock clock(outTrace);
+
 	// Embedding lookup is a single row of the token table.
 	const GgufTensor* embedding = m_model->getTokenEmbedding();
 	const uint64_t rowBytes = getStorageSize(embedding->type, embed);
 	dequantize(embedding->type, (const uint8_t*)embedding->data + (uint64_t)token * rowBytes, m_x.ptr(), embed);
+
+	if (outTrace)
+		outTrace->embeddingNorm = length(m_x.c_ptr(), embed);
+
+	clock.mark(ForwardTrace::StEmbedding);
 
 	for (int32_t l = 0; l < parameters.layerCount; ++l)
 	{
@@ -142,6 +192,7 @@ bool Context::evaluate(int32_t token, bool computeLogits)
 		float* value = m_valueCache.ptr() + ((size_t)l * m_contextLength + position) * kv;
 
 		rmsNorm(m_xb.ptr(), m_x.c_ptr(), layer.attentionNorm.c_ptr(), embed, parameters.rmsNormEpsilon);
+		clock.mark(ForwardTrace::StAttentionNorm);
 
 		matmul(m_query.ptr(), *layer.attentionQ, m_xb.c_ptr(), embed, embed);
 		matmul(key, *layer.attentionK, m_xb.c_ptr(), embed, kv);
@@ -150,18 +201,23 @@ bool Context::evaluate(int32_t token, bool computeLogits)
 		addBias(m_query.ptr(), layer.attentionQBias, embed);
 		addBias(key, layer.attentionKBias, kv);
 		addBias(value, layer.attentionVBias, kv);
+		clock.mark(ForwardTrace::StProjection);
 
 		// Position enters the network here, and only here.
 		const float* frequencyFactors = m_model->getRopeFrequencyFactors();
 		rope(m_query.ptr(), parameters.headCount, parameters.headDim, parameters.ropeDim, position, parameters.ropeFreqBase, parameters.ropeFreqScale, parameters.ropeType, frequencyFactors);
 		rope(key, parameters.headCountKv, parameters.headDim, parameters.ropeDim, position, parameters.ropeFreqBase, parameters.ropeFreqScale, parameters.ropeType, frequencyFactors);
+		clock.mark(ForwardTrace::StRotary);
 
 		attend(l, position);
+		clock.mark(ForwardTrace::StAttention);
 
 		matmul(m_xb2.ptr(), *layer.attentionOutput, m_xb.c_ptr(), embed, embed);
 		addTo(m_x.ptr(), m_xb2.c_ptr(), embed);
+		clock.mark(ForwardTrace::StAttentionOutput);
 
 		rmsNorm(m_xb.ptr(), m_x.c_ptr(), layer.feedForwardNorm.c_ptr(), embed, parameters.rmsNormEpsilon);
+		clock.mark(ForwardTrace::StFeedForwardNorm);
 
 		matmul(m_hb.ptr(), *layer.feedForwardGate, m_xb.c_ptr(), embed, ff);
 		matmul(m_hb2.ptr(), *layer.feedForwardUp, m_xb.c_ptr(), embed, ff);
@@ -169,6 +225,10 @@ bool Context::evaluate(int32_t token, bool computeLogits)
 
 		matmul(m_xb2.ptr(), *layer.feedForwardDown, m_hb.c_ptr(), ff, embed);
 		addTo(m_x.ptr(), m_xb2.c_ptr(), embed);
+		clock.mark(ForwardTrace::StFeedForward);
+
+		if (outTrace)
+			outTrace->residualNorms.push_back(length(m_x.c_ptr(), embed));
 	}
 
 	++m_position;
@@ -178,6 +238,10 @@ bool Context::evaluate(int32_t token, bool computeLogits)
 
 	rmsNorm(m_xb.ptr(), m_x.c_ptr(), m_model->getOutputNorm().c_ptr(), embed, parameters.rmsNormEpsilon);
 	matmul(m_logits.ptr(), *m_model->getOutput(), m_xb.c_ptr(), embed, parameters.vocabularyCount);
+	clock.mark(ForwardTrace::StOutput);
+
+	if (outTrace)
+		outTrace->computedLogits = true;
 
 	m_logitsValid = true;
 	return true;

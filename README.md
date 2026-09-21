@@ -64,6 +64,43 @@ reference implementation. It moves on any difference in the forward pass,
 including differences far too small to change the sampled token. A greedy
 argmax is not a sensitive test.
 
+## The inspector
+
+The panel to the right of the transcript shows the reply being made rather
+than the reply. Its header keeps the latest forward pass in view as a bar
+split by stage, with a legend giving each stage's share; the log below it
+scrolls, and an entry expands or collapses when clicked.
+
+- **Prompt.** Which chat template was used, how many bytes it produced and
+  how many tokens they became. The tokens appear as chips that fill in one by
+  one as they are read into the key/value cache, so the pre-tokenizer's cuts
+  and the template markup are both visible. Tokens the cache already held
+  from the previous turn are counted rather than re-read.
+- **One entry per generated token.** The top of the distribution the token
+  was drawn from, as bars: the chosen token in the accent color, the others
+  that survived top-k and top-p filled, the ones that were cut outlined. The
+  entropy in bits says how sure the model was. Under that, where this token's
+  forward pass spent its time, and the length of the residual stream after
+  every layer, which climbs because each layer only ever adds to it. The end
+  of turn token gets an entry too, since choosing to stop is a choice.
+- **Finished.** Why the reply ended, with the prompt and reply rates.
+
+**Interactive** on the toolbar hands the sampler's job to you. At every step
+the generator draws a token as usual, then stops and shows the distribution
+in the inspector with the sampler's draw outlined; click any row to make
+that the next token, including one the cuts would have excluded, or the end
+of turn token to stop. The reply continues from your choice, and the token's
+entry records both what you picked and what the sampler drew. **Stop** ends a
+reply left waiting; switching the mode off mid reply lets the pending draw
+stand. Turning it on shows the inspector if it was hidden, since that is
+where the choosing happens.
+
+The account comes from `Generator::flushTrace`, fed by optional trace
+arguments to `Context::evaluate` and `Sampler::sample`; with the panel hidden
+(the **Inspector** toolbar button) nothing is recorded. The timing adds a
+timer read per stage and a dot product per layer to each pass, which is
+below the noise of the matrix products around them.
+
 ## Testing without a model
 
 `scripts/misc/make-test-gguf.py` writes synthetic GGUF files that need no

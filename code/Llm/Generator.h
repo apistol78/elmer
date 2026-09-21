@@ -15,6 +15,7 @@
 #include "Core/Thread/Signal.h"
 #include "Llm/ChatTemplate.h"
 #include "Llm/Sampler.h"
+#include "Llm/Trace.h"
 
 #include <string>
 
@@ -45,6 +46,7 @@ enum class GeneratorState
 	Idle,
 	Prompt,		//!< Reading the conversation into the key/value cache.
 	Generating, //!< Producing the reply.
+	Waiting,	//!< Holding a distribution for the user to pick the next token from.
 	Finished,
 	Cancelled,
 	Failed
@@ -116,6 +118,37 @@ public:
 	/*! Forget the conversation, so the next prompt starts from nothing. */
 	void resetConversation();
 
+	/*! Describe every step of generation as it happens.
+	 *
+	 * Off by default. On, each prompt token read, each token drawn and the
+	 * distribution it was drawn from is recorded as a TraceEvent; collect
+	 * them with flushTrace, or they accumulate until the generator is
+	 * destroyed. Takes effect from the next begin.
+	 */
+	void setTraceEnabled(bool enable);
+
+	bool getTraceEnabled() const;
+
+	/*! Take the events recorded since the last call, oldest first. */
+	void flushTrace(AlignedVector< TraceEvent >& outEvents);
+
+	/*! Let the user pick every token of the reply.
+	 *
+	 * On, each step records the distribution as a ChoiceOffered event, with
+	 * the sampler's own draw as the suggestion, and waits in the Waiting
+	 * state until chooseToken answers or cancel ends the run. Implies
+	 * tracing. Takes effect from the next step.
+	 */
+	void setInteractive(bool enable);
+
+	bool getInteractive() const;
+
+	/*! Answer a pending choice with \a token; negative takes the suggestion.
+	 *
+	 * \return False if no choice is pending.
+	 */
+	bool chooseToken(int32_t token);
+
 private:
 	Ref< const Model > m_model;
 	Ref< Context > m_context;
@@ -136,17 +169,28 @@ private:
 	double m_promptRate = 0.0;
 	double m_generateRate = 0.0;
 	bool m_cancel = false;
+	bool m_traceEnabled = false;
+	AlignedVector< TraceEvent > m_trace;
+	bool m_interactive = false;
+	Signal m_choice;
+	int32_t m_chosenToken = -1;
 
 	void threadGenerate();
 
 	void generate();
 
-	/*! Tokenize \a messages, dropping old turns until the result fits. */
-	bool buildPrompt(const AlignedVector< ChatMessage >& messages, int32_t maximumTokens, AlignedVector< int32_t >& outTokens);
+	/*! Tokenize \a messages, dropping old turns until the result fits.
+	 *
+	 * \param outDroppedTurns How many turns had to go.
+	 * \param outPromptBytes Length of the formatted prompt that was kept.
+	 */
+	bool buildPrompt(const AlignedVector< ChatMessage >& messages, int32_t maximumTokens, AlignedVector< int32_t >& outTokens, int32_t& outDroppedTurns, int32_t& outPromptBytes);
 
 	void appendText(const std::string& text);
 
 	void setState(GeneratorState state, const std::wstring& message);
+
+	void pushTrace(const TraceEvent& event);
 };
 
 }

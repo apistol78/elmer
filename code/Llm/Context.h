@@ -23,6 +23,7 @@
 namespace traktor::llm
 {
 
+class ForwardTrace;
 class Model;
 
 /*! Context length used when the caller does not choose one.
@@ -71,9 +72,13 @@ public:
 	 * \param computeLogits Skip the output projection when only the key and
 	 *                      value cache matter, as when consuming a prompt.
 	 *                      Saves the single largest matrix product per token.
+	 * \param outTrace Optional record of where the pass spent its time and
+	 *                 how the residual grew, for showing the network at work.
+	 *                 Costs a timer read per stage and a dot product per
+	 *                 layer, nothing the pass would notice.
 	 * \return False if the context is full.
 	 */
-	bool evaluate(int32_t token, bool computeLogits);
+	bool evaluate(int32_t token, bool computeLogits, ForwardTrace* outTrace = nullptr);
 
 	/*! Logits of the last evaluation, or null if none were computed. */
 	float* getLogits() { return m_logitsValid ? m_logits.ptr() : nullptr; }

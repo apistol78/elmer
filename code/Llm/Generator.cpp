@@ -32,6 +32,17 @@ namespace
 // the context, however many tokens the caller asked for.
 const int32_t c_maximumReserveShare = 2;
 
+/*! Text of \a token for a trace.
+ *
+ * Unlike the reply, a trace wants to show chat markup, since seeing
+ * "<|im_start|>" go by is the point; control tokens keep their own text.
+ */
+std::string tracePiece(const Tokenizer* tokenizer, const Vocabulary* vocabulary, int32_t token)
+{
+	if (vocabulary->getTokenType(token) == TokenType::Control)
+		return vocabulary->getTokenText(token);
+	return tokenizer->decode(token);
+}
 
 }
 
@@ -90,7 +101,7 @@ bool Generator::begin(const AlignedVector< ChatMessage >& messages, int32_t maxi
 	{
 		T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
 
-		if (m_state == GeneratorState::Prompt || m_state == GeneratorState::Generating)
+		if (m_state == GeneratorState::Prompt || m_state == GeneratorState::Generating || m_state == GeneratorState::Waiting)
 			return false;
 
 		m_messages = messages;
@@ -125,7 +136,7 @@ GeneratorState Generator::getState() const
 bool Generator::isBusy() const
 {
 	const GeneratorState state = getState();
-	return state == GeneratorState::Prompt || state == GeneratorState::Generating;
+	return state == GeneratorState::Prompt || state == GeneratorState::Generating || state == GeneratorState::Waiting;
 }
 
 std::string Generator::flushText()
@@ -191,12 +202,53 @@ void Generator::resetConversation()
 
 	// The worker owns the evaluated token list while it runs, so refuse
 	// rather than clear it out from under it.
-	if (m_state == GeneratorState::Prompt || m_state == GeneratorState::Generating)
+	if (m_state == GeneratorState::Prompt || m_state == GeneratorState::Generating || m_state == GeneratorState::Waiting)
 		return;
 
 	m_evaluated.clear();
 	if (m_context)
 		m_context->reset();
+}
+
+void Generator::setTraceEnabled(bool enable)
+{
+	T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
+	m_traceEnabled = enable;
+}
+
+bool Generator::getTraceEnabled() const
+{
+	T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
+	return m_traceEnabled;
+}
+
+void Generator::flushTrace(AlignedVector< TraceEvent >& outEvents)
+{
+	T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
+	outEvents.swap(m_trace);
+}
+
+void Generator::setInteractive(bool enable)
+{
+	T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
+	m_interactive = enable;
+}
+
+bool Generator::getInteractive() const
+{
+	T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
+	return m_interactive;
+}
+
+bool Generator::chooseToken(int32_t token)
+{
+	T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
+	if (m_state != GeneratorState::Waiting)
+		return false;
+
+	m_chosenToken = token;
+	m_choice.set();
+	return true;
 }
 
 void Generator::threadGenerate()
@@ -219,22 +271,67 @@ void Generator::generate()
 {
 	AlignedVector< ChatMessage > messages;
 	int32_t maximumTokens;
+	bool trace;
 	{
 		T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
 		messages = m_messages;
 		maximumTokens = m_maximumTokens;
+
+		// A choice cannot be offered without the distribution to show, so
+		// interactive mode records whether asked to or not.
+		trace = m_traceEnabled || m_interactive;
+		m_choice.reset();
 	}
 
+	// Read afresh at every step, so the mode can change mid reply.
+	const auto isInteractive = [&]() {
+		T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
+		return m_interactive;
+	};
+
+	Timer timer;
+	double promptSeconds = 0.0;
+	int32_t generated = 0;
+	bool generating = false;
+
+	// Every way out of here ends the run the same way: the state for the
+	// caller, and for a trace, the closing event with the totals.
+	const auto finish = [&](GeneratorState state, const std::wstring& message, const std::wstring& outcome) {
+		setState(state, message);
+
+		if (!trace)
+			return;
+
+		TraceEvent event;
+		event.kind = TraceEvent::Kind::Finished;
+		event.outcome = outcome;
+		event.promptSeconds = promptSeconds;
+		event.generateSeconds = generating ? timer.getElapsedTime() : 0.0;
+		event.generatedTokenCount = generated;
+		{
+			T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
+			event.promptTokenCount = m_promptTokenCount;
+		}
+		pushTrace(event);
+	};
+
+	const auto isCancelled = [&]() {
+		T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
+		return m_cancel;
+	};
+
 	AlignedVector< int32_t > tokens;
-	if (!buildPrompt(messages, maximumTokens, tokens))
+	int32_t droppedTurns = 0;
+	int32_t promptBytes = 0;
+	if (!buildPrompt(messages, maximumTokens, tokens, droppedTurns, promptBytes))
 	{
-		setState(GeneratorState::Failed, L"Conversation does not fit in the context.");
+		finish(GeneratorState::Failed, L"Conversation does not fit in the context.", L"Failed: the conversation does not fit in the context.");
 		return;
 	}
 
 	if (tokens.empty())
 	{
-		setState(GeneratorState::Failed, L"Prompt is empty.");
+		finish(GeneratorState::Failed, L"Prompt is empty.", L"Failed: the prompt is empty.");
 		return;
 	}
 
@@ -251,20 +348,32 @@ void Generator::generate()
 	m_context->rewind((int32_t)shared);
 	m_evaluated.resize(shared);
 
-	Timer timer;
+	if (trace)
+	{
+		TraceEvent event;
+		event.kind = TraceEvent::Kind::PromptBuilt;
+		event.templateName = m_model->getChatTemplate()->getKindName();
+		event.promptBytes = promptBytes;
+		event.sharedTokens = (int32_t)shared;
+		event.droppedTurns = droppedTurns;
+		event.promptTokens = tokens;
+		pushTrace(event);
+	}
+
 	timer.reset();
 
 	setState(GeneratorState::Prompt, L"");
 
 	for (size_t i = shared; i < tokens.size(); ++i)
 	{
+		if (isCancelled())
+		{
+			finish(GeneratorState::Cancelled, L"", L"Stopped while reading the prompt.");
+			return;
+		}
+
 		{
 			T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
-			if (m_cancel)
-			{
-				setState(GeneratorState::Cancelled, L"");
-				return;
-			}
 			m_promptTokenCount = (int32_t)(i - shared + 1);
 		}
 
@@ -272,57 +381,142 @@ void Generator::generate()
 		// to fill the cache, and skipping the output projection for them is
 		// the cheapest speedup available here.
 		const bool last = (i + 1 == tokens.size());
-		if (!m_context->evaluate(tokens[i], last))
+
+		ForwardTrace forward;
+		if (!m_context->evaluate(tokens[i], last, trace ? &forward : nullptr))
 		{
-			setState(GeneratorState::Failed, L"Context is full.");
+			finish(GeneratorState::Failed, L"Context is full.", L"Failed: the context filled up while reading the prompt.");
 			return;
 		}
 
 		m_evaluated.push_back(tokens[i]);
+
+		if (trace)
+		{
+			TraceEvent event;
+			event.kind = TraceEvent::Kind::PromptToken;
+			event.token = tokens[i];
+			event.position = forward.position;
+			event.piece = tracePiece(tokenizer, vocabulary, tokens[i]);
+			event.forward = forward;
+			pushTrace(event);
+		}
 	}
 
+	promptSeconds = timer.getElapsedTime();
 	{
-		const double elapsed = timer.getElapsedTime();
 		T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
-		if (elapsed > 0.0 && m_promptTokenCount > 0)
-			m_promptRate = m_promptTokenCount / elapsed;
+		if (promptSeconds > 0.0 && m_promptTokenCount > 0)
+			m_promptRate = m_promptTokenCount / promptSeconds;
 	}
 
 	setState(GeneratorState::Generating, L"");
 
 	timer.reset();
-	int32_t generated = 0;
+	generating = true;
 	bool emitted = false;
 
 	while (generated < maximumTokens)
 	{
+		if (isCancelled())
 		{
-			T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
-			if (m_cancel)
-			{
-				setState(GeneratorState::Cancelled, L"");
-				return;
-			}
+			finish(GeneratorState::Cancelled, L"", L"Stopped by the user.");
+			return;
 		}
 
 		float* logits = m_context->getLogits();
 		if (logits == nullptr)
 		{
-			setState(GeneratorState::Failed, L"No logits produced.");
+			finish(GeneratorState::Failed, L"No logits produced.", L"Failed: the forward pass produced no logits.");
 			return;
 		}
 
+		const bool interactive = isInteractive();
+
 		int32_t token;
+		SampleTrace sample;
 		{
 			T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
-			token = m_sampler->sample(logits, m_context->getLogitCount(), m_evaluated);
+			token = m_sampler->sample(logits, m_context->getLogitCount(), m_evaluated, (trace || interactive) ? &sample : nullptr);
 		}
 
-		if (token < 0 || vocabulary->isEndOfGeneration(token))
-			break;
-
+		if (token < 0)
 		{
-			std::string piece = tokenizer->decode(token);
+			finish(GeneratorState::Failed, L"Sampler produced no token.", L"Failed: the sampler produced no token.");
+			return;
+		}
+
+		if (interactive)
+		{
+			// The sampler has drawn; now the user gets to overrule it. Show
+			// the distribution, wait, and carry on with whatever they picked.
+			sample.interactive = true;
+			sample.suggested = token;
+
+			TraceEvent offer;
+			offer.kind = TraceEvent::Kind::ChoiceOffered;
+			offer.position = m_context->getPosition();
+			offer.sample = sample;
+			pushTrace(offer);
+
+			setState(GeneratorState::Waiting, L"");
+
+			int32_t chosen = -1;
+			for (;;)
+			{
+				if (m_thread->stopped())
+					return;
+
+				if (isCancelled())
+				{
+					finish(GeneratorState::Cancelled, L"", L"Stopped while waiting for a choice.");
+					return;
+				}
+
+				if (m_choice.wait(50))
+				{
+					T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
+					m_choice.reset();
+					chosen = m_chosenToken;
+					break;
+				}
+			}
+
+			if (chosen >= 0 && chosen < m_context->getLogitCount())
+				token = chosen;
+
+			sample.chosen = token;
+			sample.chosenProbability = 0.0f;
+			for (const auto& candidate : sample.candidates)
+			{
+				if (candidate.token == token)
+					sample.chosenProbability = candidate.probability;
+			}
+
+			setState(GeneratorState::Generating, L"");
+		}
+
+		if (vocabulary->isEndOfGeneration(token))
+		{
+			// The stop token is a choice like any other, and the one most
+			// worth seeing; it just has no forward pass after it.
+			if (trace)
+			{
+				TraceEvent event;
+				event.kind = TraceEvent::Kind::GeneratedToken;
+				event.token = token;
+				event.position = m_context->getPosition();
+				event.piece = tracePiece(tokenizer, vocabulary, token);
+				event.endOfGeneration = true;
+				event.sample = sample;
+				pushTrace(event);
+			}
+			break;
+		}
+
+		const std::string raw = tokenizer->decode(token);
+		{
+			std::string piece = raw;
 
 			// A reply opens on a word boundary, so the space the first token
 			// carries is markup rather than content.
@@ -349,9 +543,24 @@ void Generator::generate()
 
 		m_evaluated.push_back(token);
 
-		if (!m_context->evaluate(token, true))
+		ForwardTrace forward;
+		const bool evaluated = m_context->evaluate(token, true, trace ? &forward : nullptr);
+
+		if (trace)
 		{
-			setState(GeneratorState::Finished, L"Context is full; the reply was cut short.");
+			TraceEvent event;
+			event.kind = TraceEvent::Kind::GeneratedToken;
+			event.token = token;
+			event.position = evaluated ? forward.position : m_context->getPosition();
+			event.piece = raw;
+			event.sample = sample;
+			event.forward = forward;
+			pushTrace(event);
+		}
+
+		if (!evaluated)
+		{
+			finish(GeneratorState::Finished, L"Context is full; the reply was cut short.", L"Context is full; the reply was cut short.");
 			return;
 		}
 	}
@@ -364,10 +573,13 @@ void Generator::generate()
 		m_partial.clear();
 	}
 
-	setState(GeneratorState::Finished, L"");
+	if (generated >= maximumTokens)
+		finish(GeneratorState::Finished, L"", L"Reply reached the token limit of " + toString(maximumTokens) + L".");
+	else
+		finish(GeneratorState::Finished, L"", L"Reply complete; the model produced its end of turn token.");
 }
 
-bool Generator::buildPrompt(const AlignedVector< ChatMessage >& messages, int32_t maximumTokens, AlignedVector< int32_t >& outTokens)
+bool Generator::buildPrompt(const AlignedVector< ChatMessage >& messages, int32_t maximumTokens, AlignedVector< int32_t >& outTokens, int32_t& outDroppedTurns, int32_t& outPromptBytes)
 {
 	const Tokenizer* tokenizer = m_model->getTokenizer();
 	const ChatTemplate* chatTemplate = m_model->getChatTemplate();
@@ -380,14 +592,20 @@ bool Generator::buildPrompt(const AlignedVector< ChatMessage >& messages, int32_
 	const int32_t limit = std::max(1, contextLength - reserve);
 
 	AlignedVector< ChatMessage > kept = messages;
+	outDroppedTurns = 0;
 
 	for (;;)
 	{
+		const std::string prompt = chatTemplate->format(kept);
+
 		outTokens.resize(0);
-		tokenizer->encode(chatTemplate->format(kept), true, true, outTokens);
+		tokenizer->encode(prompt, true, true, outTokens);
 
 		if ((int32_t)outTokens.size() <= limit)
+		{
+			outPromptBytes = (int32_t)prompt.size();
 			return true;
+		}
 
 		// Drop the oldest turn that is not the system prompt, and try again.
 		size_t drop = kept.size();
@@ -405,6 +623,7 @@ bool Generator::buildPrompt(const AlignedVector< ChatMessage >& messages, int32_
 			return false;
 
 		kept.erase(kept.begin() + drop);
+		++outDroppedTurns;
 	}
 }
 
@@ -431,6 +650,12 @@ void Generator::setState(GeneratorState state, const std::wstring& message)
 	m_state = state;
 	if (!message.empty())
 		m_message = message;
+}
+
+void Generator::pushTrace(const TraceEvent& event)
+{
+	T_ANONYMOUS_VAR(Acquire< Semaphore >)(m_lock);
+	m_trace.push_back(event);
 }
 
 }

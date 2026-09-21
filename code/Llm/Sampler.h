@@ -23,6 +23,8 @@
 namespace traktor::llm
 {
 
+class SampleTrace;
+
 /*! How the next token is drawn from the model's output distribution. */
 class T_DLLCLASS SamplerSettings
 {
@@ -52,8 +54,11 @@ public:
 	/*! Pick a token from \a logits, which is modified in place.
 	 *
 	 * \param history Tokens generated so far, used by the repetition penalty.
+	 * \param outTrace Optional account of the choice: the leading candidates,
+	 *                 how many each cut left standing, and the entropy of
+	 *                 the distribution. Costs a pass over the vocabulary.
 	 */
-	int32_t sample(float* logits, int32_t count, const AlignedVector< int32_t >& history);
+	int32_t sample(float* logits, int32_t count, const AlignedVector< int32_t >& history, SampleTrace* outTrace = nullptr);
 
 private:
 	class Candidate

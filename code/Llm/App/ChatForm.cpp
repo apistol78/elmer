@@ -18,10 +18,12 @@
 #include "Core/Misc/TString.h"
 #include "Core/System/OS.h"
 #include "Llm/App/ChatView.h"
+#include "Llm/App/InferenceView.h"
 #include "Llm/Utf8.h"
 #include "Llm/Context.h"
 #include "Llm/Generator.h"
 #include "Llm/Model.h"
+#include "Llm/Trace.h"
 #include "Ui/Application.h"
 #include "Ui/Button.h"
 #include "Ui/Container.h"
@@ -32,6 +34,7 @@
 #include "Ui/Events/TimerEvent.h"
 #include "Ui/FileDialog.h"
 #include "Ui/MessageBox.h"
+#include "Ui/Splitter.h"
 #include "Ui/Static.h"
 #include "Ui/TableLayout.h"
 #include "Ui/ToolBar/ToolBar.h"
@@ -46,6 +49,9 @@ namespace
 
 const int32_t c_pollInterval = 50;
 const int32_t c_maximumReplyTokens = 1024;
+
+/*! Width of the inspector beside the transcript; it keeps this on resize. */
+const ui::Unit c_inspectorWidth = 440_ut;
 
 
 const wchar_t* const c_systemPrompt = L"You are a helpful assistant. Answer concisely.";
@@ -69,8 +75,8 @@ bool ChatForm::create(const CommandLine& commandLine)
 {
 	if (!ui::Form::create(
 			L"ELMER - Educational LLM Inference Engine",
-			900_ut,
-			700_ut,
+			1280_ut,
+			760_ut,
 			ui::Form::WsDefault,
 			new ui::TableLayout(L"100%", L"*,100%,*,*", 0_ut, 0_ut)))
 		return false;
@@ -86,11 +92,30 @@ bool ChatForm::create(const CommandLine& commandLine)
 	m_toolBar->addItem(new ui::ToolBarSeparator());
 	m_toolBar->addItem(new ui::ToolBarButton(L"New chat", ui::Command(L"Llm.NewChat")));
 	m_toolBar->addItem(new ui::ToolBarButton(L"Stop", ui::Command(L"Llm.Stop")));
+	m_toolBar->addItem(new ui::ToolBarSeparator());
+
+	m_inspectorButton = new ui::ToolBarButton(L"Inspector", ui::Command(L"Llm.Inspector"), ui::ToolBarButton::BsText | ui::ToolBarButton::BsToggled);
+	m_toolBar->addItem(m_inspectorButton);
+
+	m_interactiveButton = new ui::ToolBarButton(L"Interactive", ui::Command(L"Llm.Interactive"), ui::ToolBarButton::BsText | ui::ToolBarButton::BsToggle);
+	m_toolBar->addItem(m_interactiveButton);
+
 	m_toolBar->addEventHandler< ui::ToolBarButtonClickEvent >(this, &ChatForm::eventToolBarClick);
 
-	m_chatView = new ChatView();
-	if (!m_chatView->create(this))
+	// Transcript on the left, the inspector on the right; a negative splitter
+	// position keeps the inspector's width fixed while the transcript grows.
+	m_splitter = new ui::Splitter();
+	if (!m_splitter->create(this, true, -c_inspectorWidth, false))
 		return false;
+
+	m_chatView = new ChatView();
+	if (!m_chatView->create(m_splitter))
+		return false;
+
+	m_inferenceView = new InferenceView();
+	if (!m_inferenceView->create(m_splitter))
+		return false;
+	m_inferenceView->addEventHandler< TokenChooseEvent >(this, &ChatForm::eventTokenChoose);
 
 	Ref< ui::Container > inputRow = new ui::Container();
 	if (!inputRow->create(this, ui::WsNone, new ui::TableLayout(L"100%,*", L"*", 8_ut, 8_ut)))
@@ -177,9 +202,15 @@ bool ChatForm::loadModel(const Path& fileName)
 	if (!generator->create(model, contextLength))
 		return false;
 
+	generator->setTraceEnabled(m_inspectorButton->isToggled());
+	generator->setInteractive(m_interactiveButton->isToggled());
+
 	m_model = model;
 	m_generator = generator;
 	m_modelDescription = model->getDescription();
+
+	m_inferenceView->setModel(model);
+	m_inferenceView->setSamplerSettings(generator->getSamplerSettings());
 
 	newConversation();
 	updateEnable();
@@ -222,6 +253,9 @@ void ChatForm::newConversation()
 
 	if (m_chatView)
 		m_chatView->removeAllMessages();
+
+	if (m_inferenceView)
+		m_inferenceView->clear();
 
 	if (m_generator)
 		m_generator->resetConversation();
@@ -275,6 +309,42 @@ void ChatForm::finishReply(bool cancelled)
 	updateStatus();
 }
 
+void ChatForm::toggleInspector()
+{
+	const bool visible = m_inspectorButton->isToggled();
+
+	m_inferenceView->setVisible(visible);
+
+	// Tracing costs a little per token, so only pay for it while it shows.
+	if (m_generator)
+		m_generator->setTraceEnabled(visible);
+
+	m_splitter->update();
+}
+
+void ChatForm::toggleInteractive()
+{
+	const bool interactive = m_interactiveButton->isToggled();
+
+	// The choice is made in the inspector, so there has to be one.
+	if (interactive && !m_inspectorButton->isToggled())
+	{
+		m_inspectorButton->setToggled(true);
+		m_toolBar->update();
+		toggleInspector();
+	}
+
+	if (m_generator)
+	{
+		m_generator->setInteractive(interactive);
+
+		// Switching off with an offer open: let the sampler's draw stand
+		// rather than leave the reply hanging.
+		if (!interactive)
+			m_generator->chooseToken(-1);
+	}
+}
+
 void ChatForm::updateStatus()
 {
 	if (!m_generator)
@@ -298,6 +368,9 @@ void ChatForm::updateStatus()
 		ss << L"   |   prompt " << toString(promptRate, 1) << L" tok/s";
 	if (generateRate > 0.0)
 		ss << L"   |   reply " << toString(generateRate, 1) << L" tok/s";
+
+	if (m_generator->getState() == GeneratorState::Waiting)
+		ss << L"   |   pick the next token in the inspector";
 
 	m_status->setText(ss.str());
 	m_status->update();
@@ -332,6 +405,10 @@ void ChatForm::eventToolBarClick(ui::ToolBarButtonClickEvent* event)
 		if (m_generator)
 			m_generator->cancel();
 	}
+	else if (command == L"Llm.Inspector")
+		toggleInspector();
+	else if (command == L"Llm.Interactive")
+		toggleInteractive();
 }
 
 void ChatForm::eventInputKeyDown(ui::KeyDownEvent* event)
@@ -348,6 +425,12 @@ void ChatForm::eventSendClick(ui::ButtonClickEvent* event)
 	submit();
 }
 
+void ChatForm::eventTokenChoose(TokenChooseEvent* event)
+{
+	if (m_generator)
+		m_generator->chooseToken(event->getToken());
+}
+
 void ChatForm::eventTimer(ui::TimerEvent* event)
 {
 	if (!m_generator)
@@ -362,12 +445,19 @@ void ChatForm::eventTimer(ui::TimerEvent* event)
 		m_chatView->setMessageText(m_replyIndex, m_reply);
 	}
 
+	// The inspector's events ride the same tick, so a reply and its account
+	// arrive together.
+	AlignedVector< TraceEvent > events;
+	m_generator->flushTrace(events);
+	if (!events.empty())
+		m_inferenceView->addEvents(events);
+
 	if (m_generating)
 	{
 		updateStatus();
 
 		const GeneratorState state = m_generator->getState();
-		if (state != GeneratorState::Prompt && state != GeneratorState::Generating)
+		if (state != GeneratorState::Prompt && state != GeneratorState::Generating && state != GeneratorState::Waiting)
 		{
 			finishReply(state == GeneratorState::Cancelled);
 

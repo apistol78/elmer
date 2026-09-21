@@ -31,9 +31,11 @@ class ButtonClickEvent;
 class CloseEvent;
 class Edit;
 class KeyDownEvent;
+class Splitter;
 class Static;
 class TimerEvent;
 class ToolBar;
+class ToolBarButton;
 class ToolBarButtonClickEvent;
 
 }
@@ -43,7 +45,9 @@ namespace traktor::llm
 
 class ChatView;
 class Generator;
+class InferenceView;
 class Model;
+class TokenChooseEvent;
 
 /*! Main window of the chat application.
  * \ingroup Llm
@@ -63,7 +67,11 @@ public:
 
 private:
 	Ref< ui::ToolBar > m_toolBar;
+	Ref< ui::ToolBarButton > m_inspectorButton;
+	Ref< ui::ToolBarButton > m_interactiveButton;
+	Ref< ui::Splitter > m_splitter;
 	Ref< ChatView > m_chatView;
+	Ref< InferenceView > m_inferenceView;
 	Ref< ui::Edit > m_input;
 	Ref< ui::Button > m_send;
 	Ref< ui::Static > m_status;
@@ -90,6 +98,12 @@ private:
 
 	void finishReply(bool cancelled);
 
+	/*! Show or hide the inspector to match its toolbar button. */
+	void toggleInspector();
+
+	/*! Hand token choice to the user, or back to the sampler, to match its button. */
+	void toggleInteractive();
+
 	void updateStatus();
 
 	void updateEnable();
@@ -101,6 +115,8 @@ private:
 	void eventInputKeyDown(ui::KeyDownEvent* event);
 
 	void eventSendClick(ui::ButtonClickEvent* event);
+
+	void eventTokenChoose(TokenChooseEvent* event);
 
 	void eventTimer(ui::TimerEvent* event);
 

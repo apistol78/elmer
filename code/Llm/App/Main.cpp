@@ -18,6 +18,7 @@
 #include "Core/System/OS.h"
 #include "Llm/App/ChatForm.h"
 #include "Llm/App/ChatView.h"
+#include "Llm/App/InferenceView.h"
 #include "Llm/Context.h"
 #include "Llm/SelfTest.h"
 #include "Ui/Application.h"
@@ -113,6 +114,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR szCmdLine, int)
 	// The default sheet has no entries for the transcript; merge ours over it
 	// rather than replacing it, so every other widget keeps its own styling.
 	ui::Application::getInstance()->appendStyleSheet(llm::ChatView::createStyleSheet());
+	ui::Application::getInstance()->appendStyleSheet(llm::InferenceView::createStyleSheet());
 
 	int32_t result = 0;
 	{
